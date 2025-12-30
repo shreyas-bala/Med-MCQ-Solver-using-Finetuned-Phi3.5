@@ -1,0 +1,105 @@
+from unsloth.chat_templates import get_chat_template
+from tqdm import tqdm
+import pandas as pd
+import json
+import torch
+from unsloth import FastLanguageModel
+from transformers import GenerationConfig
+
+model_name = "lora_model_shre_has_vpn_issues"
+
+# Load model and tokenizer
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=model_name,
+    max_seq_length=1024,
+    dtype=None,
+    load_in_4bit=True,
+)
+
+tokenizer = get_chat_template(
+    tokenizer,
+    chat_template="phi-3",
+    mapping={"role": "from", "content": "value", "user": "human", "assistant": "gpt"},
+)
+
+FastLanguageModel.for_inference(model)
+
+def format_question(item):
+    q = item["question"]
+    opts = item["options"]
+    opt_str = "\n".join([f"{k}. {opts[k]}" for k in sorted(opts)])
+    return (
+        f"{q}\n\n"
+        f"{opt_str}\n\n"
+        "Please reason through the options and then give your answer in the following format:\n"
+        "Explanation: <your explanation>\n"
+        "Answer: <correct option letter>) <option text>"
+    )
+
+def get_reasoning_and_answer(messages, options):
+    input_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt"
+    ).to("cuda")
+
+    outputs = model.generate(
+        input_ids=input_ids,
+        max_new_tokens=512,
+        do_sample=False,
+        use_cache=True,
+        pad_token_id=tokenizer.eos_token_id
+    )
+
+    output_text = tokenizer.decode(outputs[0][input_ids.shape[1]:], skip_special_tokens=True).strip()
+
+    # Split explanation and answer
+    explanation = ""
+    answer_letter = None
+    answer_text = None
+
+    for line in output_text.split("\n"):
+        line = line.strip()
+        if line.lower().startswith("explanation:"):
+            explanation = line[len("explanation:"):].strip()
+        elif line.lower().startswith("answer:"):
+            answer_part = line[len("answer:"):].strip()
+            if ")" in answer_part:
+                parts = answer_part.split(")", 1)
+                answer_letter = parts[0].strip().upper()
+                answer_text = parts[1].strip()
+            elif answer_part[:1] in options:
+                answer_letter = answer_part[:1].upper()
+                answer_text = options.get(answer_letter, "")
+
+    return explanation, answer_letter, answer_text
+
+import json
+paths = ["test_easy.jsonl", "test_medium.jsonl", "test_hard.jsonl"]
+
+combined_test_data = []
+for path in paths:
+    with open(path, 'r') as f:
+        for line in f:
+            combined_test_data.append(json.loads(line))
+
+print(f"Total combined examples: {len(combined_test_data)}")
+
+
+# Process dataset
+results = []
+for item in tqdm(combined_test_data):
+    prompt = format_question(item)
+    messages = [{"from": "human", "value": prompt}]
+    explanation, answer_letter, answer_text = get_reasoning_and_answer(messages, item["options"])
+    results.append({
+        "id": item["id"],
+        "explanation": explanation,
+        "answer": f"{answer_letter})" if answer_letter else ""
+    })
+
+# Save to CSV
+df = pd.DataFrame(results)
+df.to_csv("submission_vpn_issues.csv", index=False)
+print("✅ Saved to submission_with_reasoning.csv")
