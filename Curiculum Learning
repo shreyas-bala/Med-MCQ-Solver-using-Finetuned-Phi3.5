@@ -1,0 +1,177 @@
+!pip install unsloth
+!pip install "unsloth @ git+https://github.com/unslothai/unsloth.git"
+!pip install --no-deps "xformers==0.0.27" trl peft accelerate bitsandbytes
+!pip uninstall xformers -y
+!pip3 install -U xformers --index-url https://download.pytorch.org/whl/cu126
+
+from unsloth import FastLanguageModel
+import torch
+
+max_seq_length = 4096
+dtype = None
+load_in_4bit = False
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name = "microsoft/Phi-3.5-mini-instruct",
+    max_seq_length = max_seq_length,
+    dtype = torch.bfloat16,
+    device_map = {"": torch.cuda.current_device()}
+)
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = 16,
+    target_modules = ["q_proj", "k_proj","v_proj", "o_proj", "gate_proj","up_proj","down_proj"],
+    lora_alpha = 32,
+    lora_dropout = 0,
+    bias = "none",
+    use_gradient_checkpointing = "unsloth",
+    random_state = 3407,
+    use_rslora = False,
+    loftq_config = None,
+)
+
+from unsloth.chat_templates import get_chat_template
+tokenizer = get_chat_template(
+    tokenizer,
+    chat_template = "phi-3",
+    mapping = {
+        "role": "from",
+        "content": "value",
+        "user": "human",
+        "assistant": "gpt"
+
+    }
+)
+
+def formatting_prompts_func(example):
+    return {
+        "text": tokenizer.apply_chat_template(
+            [{"from": example["from"], "value": example["value"]}],
+            tokenize=False,
+            add_generation_prompt=False
+        )
+    }
+pass
+
+from datasets import load_dataset
+easy_dataset = load_dataset("json", data_files="converted_easy.jsonl", split="train")
+easy_dataset = easy_dataset.map(formatting_prompts_func)
+
+unsloth_template = """
+{{ bos_token }}
+You are a medical assistant answering multiple choice questions.\n
+{% for message in messages %}
+    {% if message['from'] == 'human' %}
+        {{ '### Question:\n' + message['value'] + '\n' }}
+    {% else %}
+        {{ '### Answer: ' + message['value'] + eos_token + '\n' }}
+    {% endif %}
+{% endfor %}
+"""
+unsloth_eos_token = "eos_token"
+
+if False:
+    tokenizer = get_chat_template(
+    tokenizer,
+    chat_template = unsloth_template,
+    eos_token = unsloth_eos_token,
+    mapping = {
+        "role": "from",
+        "content": "value",
+        "user": "human",
+        "assistant": "gpt"
+    },
+    map_eos_token = True
+    )
+
+
+from trl import SFTTrainer
+from transformers import TrainingArguments
+from unsloth import is_bfloat16_supported
+
+trainer = SFTTrainer(
+    model = model,
+    tokenizer = tokenizer,
+    train_dataset = easy_dataset,
+    dataset_text_field = "text",
+    max_seq_length = max_seq_length,
+    dataset_num_proc = 2,
+    packing = False, # Can make training 5x faster for short sequences.
+
+    args = TrainingArguments(
+        per_device_train_batch_size = 2,
+        gradient_accumulation_steps = 4,
+        max_steps = 60,
+        warmup_steps = 5,
+        learning_rate = 2e-4,
+        fp16 = not is_bfloat16_supported(),
+        bf16 = is_bfloat16_supported(),
+        logging_steps = 1,
+        optim = "adamw_8bit",
+        weight_decay = 0.01,
+        lr_scheduler_type = "linear",
+        seed = 3407,
+        output_dir = "outputs",
+    ),
+)
+
+trainer_stats = trainer.train()
+
+model.save_pretrained("lora_model_easylearnt") # Local saving
+tokenizer.save_pretrained("lora_model_easy_learnt")
+# model.push_to_hub("your_name/lora_model", token = "...") # Online saving
+# tokenizer.push_to_hub("your_name/lora_model", token = "...") # Online saving
+
+from unsloth import FastLanguageModel
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name = "lora_model_easylearnt",
+    max_seq_length = 4096,
+    dtype = None,
+    load_in_4bit = False # or False depending on your previous training
+)
+
+
+from datasets import load_dataset
+
+medium_dataset = load_dataset("json", data_files="converted_medium.jsonl", split="train" )
+medium_dataset = medium_dataset.map(formatting_prompts_func)
+
+
+from trl import SFTTrainer
+from transformers import TrainingArguments
+from unsloth import is_bfloat16_supported
+
+trainer = SFTTrainer(
+    model = model,
+    tokenizer = tokenizer,
+    train_dataset = medium_dataset,
+    dataset_text_field = "text",
+    max_seq_length = max_seq_length,
+    dataset_num_proc = 2,
+    packing = False, # Can make training 5x faster for short sequences.
+
+    args = TrainingArguments(
+        per_device_train_batch_size = 2,
+        gradient_accumulation_steps = 4,
+        max_steps = 20,
+        warmup_steps = 5,
+        learning_rate = 2e-4,
+        fp16 = not is_bfloat16_supported(),
+        bf16 = is_bfloat16_supported(),
+        logging_steps = 1,
+        optim = "adamw_8bit",
+        weight_decay = 0.01,
+        lr_scheduler_type = "linear",
+        seed = 3407,
+        output_dir = "outputs",
+    ),
+)
+
+trainer_stats = trainer.train()
+
+model.save_pretrained("lora_model_learnt") # Local saving
+tokenizer.save_pretrained("lora_model_learnt")
+# model.push_to_hub("your_name/lora_model", token = "...") # Online saving
+# tokenizer.push_to_hub("your_name/lora_model", token = "...") # Online saving
