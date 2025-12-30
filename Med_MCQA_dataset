@@ -1,0 +1,347 @@
+import pandas as pd
+from datasets import load_dataset
+
+# Load MedMCQA
+dataset = load_dataset("medmcqa")["train"]
+df = pd.DataFrame(dataset)
+
+# Convert numeric 'cop' (1-4) to letters (A-D)
+def int_to_letter(i):
+    return ["A", "B", "C", "D"][i]
+
+df["formatted"] = df.apply(
+    lambda row: f"Question: {row['question']}\n"
+                f"Options: A) {row['opa']} B) {row['opb']} "
+                f"C) {row['opc']} D) {row['opd']}\n"
+                f"Answer: {int_to_letter(row['cop'])}\n"  # Fixed: converts 2 -> B
+                f"Explanation: {row['exp']}",
+    axis=1
+)
+
+# Save and reload properly
+df[["formatted"]].to_json("medmcqa_clean.jsonl", orient="records", lines=True)
+train_dataset = load_dataset("json", data_files="medmcqa_clean.jsonl")["train"]
+
+import json
+import re
+import logging
+from typing import Dict, Any, Optional
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class MedicalSpellChecker:
+    def __init__(self):
+        self.medical_corrections = {
+            "hyperophy": "hypertrophy",
+            "prismatic": "prostatic",
+            "benign prismatic hyperplasia": "benign prostatic hyperplasia",
+            "aery" : "artery",
+        }
+
+    def correct_medical_text(self, text: str) -> str:
+        if not text:
+            return text
+        corrected_text = text
+        for wrong, correct in self.medical_corrections.items():
+            pattern = re.compile(re.escape(wrong), re.IGNORECASE)
+            corrected_text = pattern.sub(correct, corrected_text)
+        return corrected_text
+
+class MedicalDatasetParser:
+    def __init__(self):
+        self.spell_checker = MedicalSpellChecker()
+
+    def parse_entry(self, entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            text = entry.get("formatted", "")
+            if not text:
+                return None
+
+            # Extract question
+            question_match = re.search(r'Question:\s*(.*?)(?=\s*Options:)', text, re.DOTALL)
+            question = question_match.group(1).strip() if question_match else ""
+
+            # Extract options robustly
+            options_match = re.search(r'Options:\s*(.*?)(?=\s*Answer:)', text, re.DOTALL)
+            options_text = options_match.group(1).strip() if options_match else ""
+            options = {}
+            # Updated regex: handles newlines, spaces, and trailing noise
+            matches = re.findall(r'([A-D])\)\s*([\s\S]*?)(?=\n?[A-D]\)|\n?Answer:|\Z)', options_text)
+            for letter, opt_text in matches:
+                options[letter] = opt_text.strip()
+
+            # Extract answer more flexibly
+            answer_match = re.search(r'Answer:\s*([A-D])(?:\s|[\n\)])', text)
+            correct_answer = answer_match.group(1).strip() if answer_match else None
+
+            # Fallback: loose match
+            if not correct_answer or correct_answer not in options:
+                loose_match = re.search(r'Answer:\s*([A-D])', text)
+                if loose_match and loose_match.group(1) in options:
+                    correct_answer = loose_match.group(1)
+
+            # Final fallback to first option
+            if not correct_answer and options:
+                correct_answer = next(iter(options))
+
+            # Extract explanation
+            explanation_match = re.search(r'Explanation:\s*(.*)', text, re.DOTALL)
+            explanation = explanation_match.group(1).strip() if explanation_match else ""
+
+            if not question or len(options) < 4 or not correct_answer:
+                logger.warning(f"Skipping due to incomplete data. Question: {question[:50]}...")
+                return None
+
+            # Spell correction
+            question = self.spell_checker.correct_medical_text(question)
+            explanation = self.spell_checker.correct_medical_text(explanation)
+            for k in options:
+                options[k] = self.spell_checker.correct_medical_text(options[k])
+
+            return {
+                "question": question,
+                "options": options,
+                "correct_answer": correct_answer,
+                "explanation": explanation,
+                "original_id": entry.get("id", "")
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to parse entry: {e}")
+            return None
+
+    def process_dataset(self, input_file: str, output_file: str, max_samples: int = None):
+        with open(input_file, 'r', encoding='utf-8') as f:
+            raw_data = [json.loads(line) for line in f if line.strip()]
+
+        if max_samples:
+            raw_data = raw_data[:max_samples]
+
+        cleaned_data = []
+        for entry in raw_data:
+            parsed = self.parse_entry(entry)
+            if parsed:
+                cleaned_data.append(parsed)
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for entry in cleaned_data:
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+        print(f"✅ Cleaned and saved {len(cleaned_data)} entries to {output_file}")
+
+if __name__ == "__main__":
+    parser = MedicalDatasetParser()
+    parser.process_dataset(
+        input_file="medmcqa_clean.jsonl",
+        output_file="medmcqa_clean_parsed.jsonl",
+        max_samples=None
+    )
+
+import json
+import re
+from typing import List, Dict, Optional
+
+def clean_text(text: str) -> str:
+    return text.strip().replace('\n', ' ').replace('\r', ' ').strip()
+
+def parse_question_block(entry: Dict[str, str], idx: int) -> Optional[Dict]:
+    text = entry.get("formatted", "")
+    if not text:
+        print(f"❌ Q{idx:06d}: Missing 'formatted' field")
+        return None
+
+    # QUESTION
+    question_match = re.search(r'Question:\s*(.*?)\s*A\)', text, re.DOTALL)
+    question = clean_text(question_match.group(1)) if question_match else None
+
+    # OPTIONS
+    option_a_match = re.search(r'A\)\s*(.*?)\s*B\)', text, re.DOTALL)
+    option_b_match = re.search(r'B\)\s*(.*?)\s*C\)', text, re.DOTALL)
+    option_c_match = re.search(r'C\)\s*(.*?)\s*D\)', text, re.DOTALL)
+    option_d_match = re.search(r'D\)\s*(.*?)\s*Answer:', text, re.DOTALL)
+
+    options = {}
+    try:
+        options['A'] = clean_text(option_a_match.group(1))
+        options['B'] = clean_text(option_b_match.group(1))
+        options['C'] = clean_text(option_c_match.group(1))
+        options['D'] = clean_text(option_d_match.group(1))
+    except:
+        print(f"❌ Q{idx:06d}: One or more options missing or malformed")
+        return None
+
+    # ANSWER
+    answer_match = re.search(r'Answer:\s*([A-D])', text)
+    correct_answer = answer_match.group(1) if answer_match else None
+    if not correct_answer:
+        print(f"⚠️ Q{idx:06d}: Answer not in A-D → Set to None")
+
+    # EXPLANATION
+    explanation_match = re.search(r'Explanation:\s*(.*)', text, re.DOTALL)
+    explanation = clean_text(explanation_match.group(1)) if explanation_match else ""
+
+    if not question or len(options) != 4:
+        print(f"❌ Q{idx:06d}: Incomplete question/options")
+        return None
+
+    return {
+        "question_id": f"Q{idx:06d}",
+        "question": question,
+        "options": options,
+        "correct_answer": correct_answer,
+        "explanation": explanation
+    }
+
+def process_file(input_path: str, output_path: str, max_samples: int = None):
+    with open(input_path, 'r', encoding='utf-8') as f:
+        raw_data = [json.loads(line.strip()) for line in f if line.strip()]
+
+    if max_samples:
+        raw_data = raw_data[:max_samples]
+
+    parsed_questions = []
+    for idx, entry in enumerate(raw_data, start=1):
+        result = parse_question_block(entry, idx)
+        if result:
+            parsed_questions.append(result)
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for item in parsed_questions:
+            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+
+    print(f"\n✅ Parsed {len(parsed_questions)} valid entries out of {len(raw_data)} total.")
+
+if __name__ == "__main__":
+    process_file(
+        input_path="medmcqa_clean.jsonl",
+        output_path="medmcqa_clean_structured.jsonl",
+        max_samples=None  # Or set a small number like 5000 for testing
+    )
+
+okdataset = load_dataset("json", data_files="medmcqa_clean_structured.jsonl")["train"]
+
+def format_chat_entry_structured(entry):
+    # Build human prompt
+    prompt = f"Question: {entry['question'].strip()}\nOptions:\n"
+    for key in sorted(entry['options'].keys()):
+        prompt += f"{key}) {entry['options'][key].strip()}\n"
+    prompt += (
+        "\nPlease reason through the options and provide your answer in the following format:\n"
+        "Explanation: <your explanation>\n"
+        "Answer: <correct option letter and text>"
+    )
+
+    # GPT reply
+    correct_letter = entry['correct_answer'].strip()
+    correct_option = entry['options'][correct_letter].strip()
+    explanation = entry.get("explanation", "").strip()
+
+    response = (
+        f"Answer: {correct_letter}) {correct_option}\n"
+        f"Explanation: {explanation}. So the correct option is {correct_letter}"
+    )
+
+    return {
+        "messages": [
+            {"from": "human", "value": prompt},
+            {"from": "gpt", "value": response}
+        ]
+    }
+
+formatted_entries = [format_chat_entry_structured(entry) for entry in okdataset]
+
+with open("medmcqa_structured_formatted.jsonl", "w", encoding="utf-8") as f:
+    for item in formatted_entries:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+from unsloth import FastLanguageModel
+import torch
+
+max_seq_length = 2048
+dtype = None
+load_in_4bit = False
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name = "microsoft/Phi-3.5-mini-instruct",
+    max_seq_length = max_seq_length,
+    dtype = torch.bfloat16,
+    device_map = {"": torch.cuda.current_device()}
+)
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r = 8,
+    target_modules = ["q_proj", "k_proj","v_proj"],
+    lora_alpha = 32,
+    lora_dropout = 0.05,
+    bias = "none",
+    use_gradient_checkpointing = "unsloth",
+    random_state = 3407,
+    use_rslora = True,
+    loftq_config = None,
+)
+
+from unsloth.chat_templates import get_chat_template
+tokenizer = get_chat_template(
+    tokenizer,
+    chat_template = "phi-3",
+    mapping = {
+        "role": "from",
+        "content": "value",
+        "user": "human",
+        "assistant": "gpt"
+    
+    }
+)
+def formatting_prompts_func(examples):
+    convos = examples["messages"]
+    texts = [tokenizer.apply_chat_template(convo, tokenize = False, add_generation_prompt = False) for convo in convos]
+    return { "text" : texts, }
+pass
+
+
+dataset = dataset.map(formatting_prompts_func, batched=True,)
+
+from trl import SFTTrainer
+from transformers import TrainingArguments
+from unsloth import is_bfloat16_supported
+
+trainer = SFTTrainer(
+    model = model,
+    tokenizer = tokenizer,
+    train_dataset = dataset,
+    dataset_text_field = "messsages",
+    max_seq_length = max_seq_length,
+    dataset_num_proc = 2,
+    packing = False, # Can make training 5x faster for short sequences.
+
+    args = TrainingArguments(
+    per_device_train_batch_size = 4,
+    gradient_accumulation_steps = 2,
+    num_train_epochs = 1,
+    warmup_ratio = 0.1,
+    learning_rate = 1.5e-5,
+    lr_scheduler_type = "cosine",
+    fp16 = not is_bfloat16_supported(),
+    bf16 = is_bfloat16_supported(),
+    logging_steps = 10,
+    optim = "paged_adamw_8bit",
+    weight_decay = 0.01,
+    output_dir = "outputs",
+    seed = 3407,
+    save_steps = 1000,
+    save_total_limit = 1,  # Optional: only keep last 2 checkpoints to save disk space
+    dataloader_num_workers = 4,  # ✅ This is the correct place
+    dataloader_pin_memory = True,
+
+)
+)
+
+trainer.train()
+
+model.save_pretrained("lora_model_trainedonmedmcqa") # Local saving
+tokenizer.save_pretrained("lora_model_trainedonmedmcqa")
+# model.push_to_hub("your_name/lora_model", token = "...") # Online saving
+# tokenizer.push_to_hub("your_name/lora_model", token = "...") # Online saving
